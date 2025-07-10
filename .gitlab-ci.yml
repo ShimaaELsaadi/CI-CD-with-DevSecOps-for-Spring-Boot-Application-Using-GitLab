@@ -1,0 +1,144 @@
+stages:
+  - Build
+  - Test
+  - test
+  - Dependency Scanning
+  - Container Scanning
+  - Deploy
+  - DAST
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+variables:
+  Docker_Image_name: "spring_boot_app"
+  Image_Tag: "$CI_PIPELINE_IID"
+  Runner: "self-hosted-runner"
+default:
+  tags:
+    - $Runner
+#-------------------------------------------------------
+build-job:
+  image: maven:latest
+  stage: Build
+  script:
+  - echo "----------- build started ----------"
+  - mvn clean install -Dmaven.test.skip=true
+  - echo "----------- build complted ----------"
+  artifacts:
+    paths:
+      - target/
+    expire_in: 1 hour
+    when: always
+#-------------------------------------------------------------
+test-job:
+  image: maven:latest
+  stage: Test
+  dependencies: 
+    - build-job
+  script:
+    - echo "-------Running unit tests-------"
+    - mvn test -DskipCompile  
+#-------------------------------------------------------------------------
+dependency-scanning-job:
+  stage: Dependency Scanning
+  variables:
+     TRIVY_CACHE_DIR: ".trivycache/"
+  before_script:
+    - chmod +x install.sh
+    - ./install.sh
+  script:
+    - touch misc-scan-report.json 
+    - ./trivy filesystem --scanners config,vuln --exit-code 0 --format template --template "@contrib/gitlab-codequality.tpl" -o misc-scan-report.json . 
+    - cat misc-scan-report.json 
+  cache:
+    paths:
+      - .trivycache/
+  artifacts:
+    paths:
+      - misc-scan-report.json
+    reports:
+      codequality: misc-scan-report.json
+    expire_in: 1 hour
+    when: always
+#--------------------------------------------------------------------------------------------------
+container-scanning-job:
+  stage: Container Scanning
+  variables:
+      TRIVY_CACHE_DIR: ".trivycache/"
+      DOCKER_HOST: tcp://docker:2375
+      DOCKER_TLS_CERTDIR: ""
+  tags:
+    - docker
+  services:
+  - docker:dind
+  dependencies:
+    - build-job
+  before_script:
+    - apk add --no-cache curl grep sed tar
+    - TRIVY_VERSION=$(curl -sL https://api.github.com/repos/aquasecurity/trivy/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+    - curl -L https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz | tar -zxvf -
+    - ls -l
+    - docker --version
+  script:
+    - echo "----- Building Docker image for scanning -----"
+    - touch container-scan-report.json
+    - docker build -t "$CI_REPO_USR/$Docker_Image_name:$Image_Tag" .
+    - echo "----- Scanning Docker image with Trivy -----"
+    - export TRIVY_TIMEOUT=15m
+    - ./trivy image --exit-code 0 --format table "$CI_REPO_USR/$Docker_Image_name:$Image_Tag" > container-scan-report.json
+  cache:
+    paths:
+      - .trivycache/
+  artifacts:
+    paths:
+      - container-scan-report.json
+    reports:
+      codequality: container-scan-report.json 
+    expire_in: 1 hour
+    when: always     
+#--------------------------------------------------------------------------
+deploy-job:
+  stage: Deploy
+  dependencies:
+    - build-job
+  tags:
+    - docker
+  services:
+    - docker:dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - docker login -u $CI_REPO_USR -p $CI_REPO_PASSWD
+    - docker build -t "$CI_REPO_USR/$Docker_Image_name:$Image_Tag" .
+  script:
+    - echo "----- Deploy Docker image----------"
+    - docker push $CI_REPO_USR/$Docker_Image_name:$Image_Tag
+    - docker run  -d -p 5050:8080 "$CI_REPO_USR/$Docker_Image_name:$Image_Tag" 
+
+
+#-----------------------------------------------------------------------------
+dast-job:
+  stage: DAST
+  tags:
+    - docker
+  services:
+    - docker:dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - docker run  -d -p 5050:8080 "$CI_REPO_USR/$Docker_Image_name:$Image_Tag" 
+    - apk update
+    - apk add wget bash openjdk17 tar
+    - wget https://github.com/zaproxy/zaproxy/releases/download/v2.16.0/ZAP_2.16.0_Linux.tar.gz
+    - mkdir zap
+    - tar -xvf ZAP_2.16.0_Linux.tar.gz -C zap --strip-components=1
+  script: 
+    - cd zap
+    - bash ./zap.sh -cmd -quickurl http://localhost:5050 -quickprogress -quickout ../Dast-report.html
+  artifacts:
+    paths:
+      - Dast-report.html
+    expire_in: 1 hour
+    when: always
